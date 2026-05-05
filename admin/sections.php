@@ -4,16 +4,18 @@ require_once __DIR__ . '/../includes/db.php';
 require_once __DIR__ . '/../includes/functions.php';
 requireRole('admin');
 
-$msg = '';
+$msg = $_GET['msg'] ?? '';
+if ($msg) $msg = urldecode($msg);
+$error = $_GET['error'] ?? '';
+if ($error) $error = urldecode($error);
 
-// Create section with teacher assignment
+// Create section with auto teacher assignment
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_section'])) {
     $deptId = $_POST['department_id'];
     $yearLevel = $_POST['year_level'];
     $sectionNumber = $_POST['section_number'];
     $academicYear = $_POST['academic_year'];
     $semester = $_POST['semester'];
-    $teacherId = $_POST['teacher_id'];
     
     // Get department code
     $stmt = $pdo->prepare("SELECT department_code FROM departments WHERE id = ?");
@@ -29,47 +31,226 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_section'])) {
         $stmt->execute([$sectionName, $deptId, $yearLevel, $academicYear, $semester]);
         $sectionId = $pdo->lastInsertId();
         
-        // Assign the teacher to this section
-        $stmt = $pdo->prepare("INSERT INTO section_assignments (section_id, teacher_id) VALUES (?, ?)");
-        $stmt->execute([$sectionId, $teacherId]);
+        // Auto-assign ALL active teachers from this department
+        $teacherStmt = $pdo->prepare("SELECT id, full_name FROM teachers WHERE department_id = ? AND is_active = 1 ORDER BY full_name");
+        $teacherStmt->execute([$deptId]);
+        $teachers = $teacherStmt->fetchAll();
+        
+        $assignmentStmt = $pdo->prepare("INSERT INTO section_assignments (section_id, teacher_id) VALUES (?, ?)");
+        $assignedCount = 0;
+        
+        foreach ($teachers as $teacher) {
+            try {
+                $assignmentStmt->execute([$sectionId, $teacher['id']]);
+                $assignedCount++;
+            } catch (PDOException $e) {
+                // Skip if duplicate assignment (shouldn't happen but just in case)
+                if (strpos($e->getMessage(), 'unique_section_teacher') === false) {
+                    throw $e;
+                }
+            }
+        }
+        
+        // Auto-enroll all matching students (same department and year level)
+        $studentStmt = $pdo->prepare("
+            SELECT u.id, u.full_name
+            FROM users u
+            WHERE u.role = 'student' 
+              AND u.department_id = ? 
+              AND u.year_level = ?
+              AND u.is_active = 1
+        ");
+        $studentStmt->execute([$deptId, $yearLevel]);
+        $studentsToEnroll = $studentStmt->fetchAll();
+        
+        // Enroll all matching students
+        $enrollStmt = $pdo->prepare("INSERT INTO section_students (section_id, student_id) VALUES (?, ?)");
+        $enrolledCount = 0;
+        
+        foreach ($studentsToEnroll as $student) {
+            try {
+                $enrollStmt->execute([$sectionId, $student['id']]);
+                $enrolledCount++;
+            } catch (PDOException $e) {
+                // Skip if duplicate (shouldn't happen but just in case)
+                if (strpos($e->getMessage(), 'unique_section_student') === false) {
+                    throw $e;
+                }
+            }
+        }
+        
+        if ($assignedCount > 0) {
+            auditLog($_SESSION['user_id'], 'SECTION_CREATE', "Created section $sectionName with $assignedCount auto-assigned teachers and $enrolledCount auto-enrolled students");
+            $msg = "Section created with $assignedCount teachers assigned and $enrolledCount students enrolled.";
+        } else {
+            auditLog($_SESSION['user_id'], 'SECTION_CREATE', "Created section $sectionName (no teacher available in department)");
+            $msg = "Section created but no teachers available in department to assign.";
+        }
         
         $pdo->commit();
-        auditLog($_SESSION['user_id'], 'SECTION_CREATE', "Created section $sectionName with teacher $teacherId");
-        $msg = "Section created with teacher assigned.";
     } catch (Exception $e) {
         $pdo->rollBack();
         $msg = "Error creating section: " . $e->getMessage();
     }
 }
 
-// Change teacher assignment for section
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_teacher'])) {
-    $sectionId = $_POST['section_id'];
-    $teacherId = $_POST['teacher_id'];
+// Auto-assign teachers to individual section
+if (isset($_GET['auto_assign_section'])) {
+    $sectionId = intval($_GET['auto_assign_section']);
     
     try {
-        $stmt = $pdo->prepare("UPDATE section_assignments SET teacher_id = ? WHERE section_id = ?");
-        $stmt->execute([$teacherId, $sectionId]);
-        auditLog($_SESSION['user_id'], 'SECTION_TEACHER_CHANGE', "Changed teacher for section $sectionId to $teacherId");
-        $msg = "Teacher assignment updated.";
+        // Get section details
+        $sectionStmt = $pdo->prepare("SELECT id, section_name, department_id, year_level FROM sections WHERE id = ?");
+        $sectionStmt->execute([$sectionId]);
+        $section = $sectionStmt->fetch();
+        
+        if (!$section) {
+            $error = "Section ID $sectionId not found.";
+            header("Location: sections.php?error=" . urlencode($error));
+            exit;
+        } else {
+            // Start transaction
+            $pdo->beginTransaction();
+            
+            // Get ALL active teachers from this section's department
+            $teacherStmt = $pdo->prepare("SELECT id, full_name FROM teachers WHERE department_id = ? AND is_active = 1 ORDER BY full_name");
+            $teacherStmt->execute([$section['department_id']]);
+            $teachers = $teacherStmt->fetchAll();
+            
+            if (empty($teachers)) {
+                $pdo->rollBack();
+                $error = "No active teachers found in department ID {$section['department_id']}.";
+                header("Location: sections.php?error=" . urlencode($error));
+                exit;
+            } else {
+                // Assign ALL teachers to this section
+                $assignmentStmt = $pdo->prepare("INSERT INTO section_assignments (section_id, teacher_id) VALUES (?, ?)");
+                $assignedCount = 0;
+                $duplicateCount = 0;
+                
+                foreach ($teachers as $teacher) {
+                    try {
+                        $assignmentStmt->execute([$sectionId, $teacher['id']]);
+                        $assignedCount++;
+                    } catch (PDOException $e) {
+                        // Count duplicate assignments (already assigned)
+                        if (strpos($e->getMessage(), 'unique_section_teacher') !== false) {
+                            $duplicateCount++;
+                        } else {
+                            throw $e;
+                        }
+                    }
+                }
+                
+                // Auto-enroll all matching students (same department and year level) who aren't already enrolled
+                $studentStmt = $pdo->prepare("
+                    SELECT u.id, u.full_name
+                    FROM users u
+                    WHERE u.role = 'student' 
+                      AND u.department_id = ? 
+                      AND u.year_level = ?
+                      AND u.is_active = 1
+                      AND u.id NOT IN (
+                        SELECT student_id FROM section_students WHERE section_id = ?
+                      )
+                ");
+                $studentStmt->execute([$section['department_id'], $section['year_level'], $sectionId]);
+                $studentsToEnroll = $studentStmt->fetchAll();
+                
+                // Enroll all matching students
+                $enrollStmt = $pdo->prepare("INSERT INTO section_students (section_id, student_id) VALUES (?, ?)");
+                $enrolledCount = 0;
+                
+                foreach ($studentsToEnroll as $student) {
+                    try {
+                        $enrollStmt->execute([$sectionId, $student['id']]);
+                        $enrolledCount++;
+                    } catch (PDOException $e) {
+                        // Skip if duplicate (shouldn't happen but just in case)
+                        if (strpos($e->getMessage(), 'unique_section_student') === false) {
+                            throw $e;
+                        }
+                    }
+                }
+                
+                $pdo->commit();
+                
+                auditLog($_SESSION['user_id'], 'SECTION_AUTO_ASSIGN', "Auto-assigned $assignedCount teachers to section {$section['section_name']} and enrolled $enrolledCount students");
+                $msg = "Successfully assigned $assignedCount teachers to {$section['section_name']}.";
+                if ($enrolledCount > 0) {
+                    $msg .= " ($enrolledCount students auto-enrolled)";
+                }
+                if ($duplicateCount > 0) {
+                    $msg .= " ($duplicateCount teachers were already assigned)";
+                }
+                header("Location: sections.php?msg=" . urlencode($msg));
+                exit;
+            }
+        }
     } catch (Exception $e) {
-        $msg = "Error updating teacher: " . $e->getMessage();
+        $pdo->rollBack();
+        $error = "Error auto-assigning teachers: " . $e->getMessage();
+        header("Location: sections.php?error=" . urlencode($error));
+        exit;
     }
 }
 
-// Enroll student in section
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['enroll_student'])) {
-    $sectionId = $_POST['section_id'];
-    $studentId = $_POST['student_id'];
-    
+// Auto-assign teachers to all sections without teachers
+if (isset($_GET['auto_assign_all'])) {
     try {
-        $stmt = $pdo->prepare("INSERT INTO section_students (section_id, student_id) VALUES (?, ?)");
-        $stmt->execute([$sectionId, $studentId]);
-        auditLog($_SESSION['user_id'], 'SECTION_STUDENT_ENROLL', "Enrolled student $studentId in section $sectionId");
-        $msg = "Student enrolled in section.";
+        // Get all sections without any teachers
+        $stmt = $pdo->query("
+            SELECT s.id, s.department_id, s.section_name 
+            FROM sections s 
+            LEFT JOIN section_assignments sa ON s.id = sa.section_id 
+            WHERE sa.id IS NULL
+        ");
+        $sectionsWithoutTeachers = $stmt->fetchAll();
+        
+        $totalAssignments = 0;
+        $skipped = 0;
+        $assignmentDetails = [];
+        
+        foreach ($sectionsWithoutTeachers as $section) {
+            // Get ALL active teachers from this section's department
+            $teacherStmt = $pdo->prepare("SELECT id, full_name FROM teachers WHERE department_id = ? AND is_active = 1 ORDER BY full_name");
+            $teacherStmt->execute([$section['department_id']]);
+            $teachers = $teacherStmt->fetchAll();
+            
+            if (!empty($teachers)) {
+                // Assign ALL teachers from this department to the section
+                $assignmentStmt = $pdo->prepare("INSERT INTO section_assignments (section_id, teacher_id) VALUES (?, ?)");
+                $sectionAssignments = 0;
+                
+                foreach ($teachers as $teacher) {
+                    try {
+                        $assignmentStmt->execute([$section['id'], $teacher['id']]);
+                        $totalAssignments++;
+                        $sectionAssignments++;
+                    } catch (PDOException $e) {
+                        // Skip if duplicate (shouldn't happen but just in case)
+                        if (strpos($e->getMessage(), 'unique_section_teacher') === false) {
+                            throw $e;
+                        }
+                    }
+                }
+                
+                $assignmentDetails[] = "{$section['section_name']} ({$sectionAssignments} teachers)";
+            } else {
+                $skipped++;
+            }
+        }
+        
+        $pdo->commit();
+        
+        $detailsStr = !empty($assignmentDetails) ? ": " . implode(", ", $assignmentDetails) : "";
+        auditLog($_SESSION['user_id'], 'AUTO_ASSIGN_TEACHERS', "Auto-assigned $totalAssignments teacher assignments to " . count($assignmentDetails) . " sections, skipped $skipped");
+        $msg = "Auto-assignment complete: $totalAssignments teacher assignments added to " . count($assignmentDetails) . " sections, $skipped skipped (no teachers in department).$detailsStr";
     } catch (Exception $e) {
-        $msg = "Student already enrolled in this section.";
+        $error = "Error auto-assigning teachers: " . $e->getMessage();
     }
+    header("Location: sections.php" . ($error ? "?error=" . urlencode($error) : ""));
+    exit;
 }
 
 // Unenroll student from section
@@ -77,6 +258,96 @@ if (isset($_GET['unenroll'])) {
     $id = intval($_GET['unenroll']);
     $pdo->prepare("DELETE FROM section_students WHERE id = ?")->execute([$id]);
     auditLog($_SESSION['user_id'], 'SECTION_STUDENT_UNENROLL', "Unenrolled student from section");
+    header("Location: sections.php");
+    exit;
+}
+
+// Remove teacher from section by section_id and teacher_id
+if (isset($_GET['remove_teacher'])) {
+    $sectionId = intval($_GET['section_id']);
+    $teacherId = intval($_GET['teacher_id']);
+    try {
+        $pdo->prepare("DELETE FROM section_assignments WHERE section_id = ? AND teacher_id = ?")->execute([$sectionId, $teacherId]);
+        auditLog($_SESSION['user_id'], 'SECTION_TEACHER_REMOVE', "Removed teacher $teacherId from section $sectionId");
+        $msg = "Teacher removed from section.";
+    } catch (Exception $e) {
+        $msg = "Error removing teacher: " . $e->getMessage();
+    }
+    header("Location: sections.php");
+    exit;
+}
+
+// Assign teacher to section
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['assign_teacher'])) {
+    $sectionId = intval($_POST['section_id']);
+    $teacherId = intval($_POST['teacher_id']);
+    
+    if (!$teacherId) {
+        $msg = "Please select a teacher to assign.";
+    } else {
+        try {
+            // Start transaction
+            $pdo->beginTransaction();
+            
+            // Insert teacher assignment
+            $pdo->prepare("INSERT INTO section_assignments (section_id, teacher_id) VALUES (?, ?)")
+                ->execute([$sectionId, $teacherId]);
+            
+            // Get section details
+            $sectionStmt = $pdo->prepare("SELECT department_id, year_level FROM sections WHERE id = ?");
+            $sectionStmt->execute([$sectionId]);
+            $section = $sectionStmt->fetch();
+            
+            // Auto-enroll all matching students (same department and year level) who aren't already enrolled
+            $studentStmt = $pdo->prepare("
+                SELECT u.id, u.full_name
+                FROM users u
+                WHERE u.role = 'student' 
+                  AND u.department_id = ? 
+                  AND u.year_level = ?
+                  AND u.is_active = 1
+                  AND u.id NOT IN (
+                    SELECT student_id FROM section_students WHERE section_id = ?
+                  )
+            ");
+            $studentStmt->execute([$section['department_id'], $section['year_level'], $sectionId]);
+            $studentsToEnroll = $studentStmt->fetchAll();
+            
+            // Enroll all matching students
+            $enrollStmt = $pdo->prepare("INSERT INTO section_students (section_id, student_id) VALUES (?, ?)");
+            $enrolledCount = 0;
+            
+            foreach ($studentsToEnroll as $student) {
+                try {
+                    $enrollStmt->execute([$sectionId, $student['id']]);
+                    $enrolledCount++;
+                } catch (PDOException $e) {
+                    // Skip if duplicate (shouldn't happen but just in case)
+                    if (strpos($e->getMessage(), 'unique_section_student') === false) {
+                        throw $e;
+                    }
+                }
+            }
+            
+            $pdo->commit();
+            
+            auditLog($_SESSION['user_id'], 'SECTION_TEACHER_ASSIGN', "Assigned teacher $teacherId to section $sectionId and auto-enrolled $enrolledCount students");
+            $msg = "Teacher assigned successfully.";
+            if ($enrolledCount > 0) {
+                $msg .= " ($enrolledCount students auto-enrolled)";
+            }
+        } catch (PDOException $e) {
+            $pdo->rollBack();
+            if (strpos($e->getMessage(), 'Duplicate entry') !== false || strpos($e->getMessage(), 'unique_section_teacher') !== false) {
+                $msg = "This teacher is already assigned to this section.";
+            } else {
+                $msg = "Error assigning teacher: " . $e->getMessage();
+            }
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            $msg = "Error assigning teacher: " . $e->getMessage();
+        }
+    }
     header("Location: sections.php");
     exit;
 }
@@ -101,28 +372,52 @@ $sections = $pdo->query("
 
 $departments = $pdo->query("SELECT * FROM departments")->fetchAll();
 $teachers = $pdo->query("SELECT * FROM teachers WHERE is_active = 1 ORDER BY full_name")->fetchAll();
-// Get all students with their department and year level
-$allStudents = $pdo->query("SELECT u.*, d.name as dept_name FROM users u LEFT JOIN departments d ON u.department_id = d.id WHERE u.role = 'student' AND u.is_active = 1 ORDER BY u.full_name")->fetchAll();
-
-// Get all students already enrolled in ANY section
-$enrolledStudentIds = $pdo->query("SELECT DISTINCT student_id FROM section_students")->fetchAll(PDO::FETCH_COLUMN);
 
 // Get teacher and students for each section
 $sectionDetails = [];
 foreach ($sections as $s) {
-    // Get assigned teacher
+    // Get ALL teachers from this department (for display)
     $stmt = $pdo->prepare("
-        SELECT t.id, t.full_name 
+        SELECT t.id, t.full_name, t.email
+        FROM teachers t
+        WHERE t.department_id = ? AND t.is_active = 1
+        ORDER BY t.full_name
+    ");
+    $stmt->execute([$s['department_id']]);
+    $allDepartmentTeachers = $stmt->fetchAll();
+    $sectionDetails[$s['id']]['teachers'] = $allDepartmentTeachers;
+    
+    // Get assigned teacher IDs - returns array of teacher IDs
+    $stmt = $pdo->prepare("
+        SELECT DISTINCT sa.teacher_id
         FROM section_assignments sa
-        JOIN teachers t ON sa.teacher_id = t.id 
         WHERE sa.section_id = ?
     ");
     $stmt->execute([$s['id']]);
-    $sectionDetails[$s['id']]['teacher'] = $stmt->fetch();
+    $assignedTeacherIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
+    $sectionDetails[$s['id']]['assignedIds'] = $assignedTeacherIds; // Simple array of IDs
+    
+    // Get unassigned teachers for dropdown
+    $unassignedList = [];
+    foreach ($allDepartmentTeachers as $teacher) {
+        if (!in_array($teacher['id'], $assignedTeacherIds)) {
+            $unassignedList[] = $teacher;
+        }
+    }
+    $sectionDetails[$s['id']]['unassigned'] = $unassignedList;
+    
+    // Get assigned teachers with full details
+    $assignedList = [];
+    foreach ($allDepartmentTeachers as $teacher) {
+        if (in_array($teacher['id'], $assignedTeacherIds)) {
+            $assignedList[] = $teacher;
+        }
+    }
+    $sectionDetails[$s['id']]['assignedTeachers'] = $assignedList;
     
     // Get enrolled students
     $stmt = $pdo->prepare("
-        SELECT ss.id, u.full_name 
+        SELECT ss.id, ss.student_id, u.full_name 
         FROM section_students ss 
         JOIN users u ON ss.student_id = u.id 
         WHERE ss.section_id = ?
@@ -137,6 +432,91 @@ foreach ($sections as $s) {
     <meta charset="UTF-8">
     <title>Manage Sections</title>
     <link rel="stylesheet" href="../assets/css/style.css">
+    <style>
+        .student-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .student-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .student-item:last-child {
+            border-bottom: none;
+        }
+        .student-name {
+            font-weight: 500;
+        }
+        .student-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .btn-action {
+            padding: 4px 12px;
+            border-radius: 4px;
+            text-decoration: none;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+        .btn-action.edit {
+            background: #ffc107;
+            color: #212529;
+        }
+        .btn-action.edit:hover {
+            background: #e0a800;
+        }
+        .btn-action.delete {
+            background: #dc3545;
+            color: white;
+        }
+        .btn-action.delete:hover {
+            background: #c82333;
+        }
+        .teacher-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            max-height: 250px;
+            overflow-y: auto;
+        }
+        .teacher-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .teacher-item:last-child {
+            border-bottom: none;
+        }
+        .teacher-item.assigned {
+            background: #d4edda;
+            margin: 2px -5px;
+            padding: 8px 5px;
+            border-radius: 4px;
+        }
+        .teacher-item.unassigned {
+            opacity: 0.7;
+        }
+        .teacher-name {
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .badge {
+            background: #28a745;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.7rem;
+            font-weight: bold;
+        }
+    </style>
 </head>
 <body>
 <nav class="navbar">
@@ -156,7 +536,11 @@ foreach ($sections as $s) {
 
 <div class="container">
     <h2>Manage Sections</h2>
+    <p>
+        <a href="?auto_assign_all" class="btn" style="background: #28a745;" onclick="return confirm('This will assign ALL teachers from each department to sections that have no teachers. Continue?')">Auto-Assign All Teachers to All Sections</a>
+    </p>
     <?php if ($msg): ?><div class="alert success"><?php echo $msg; ?></div><?php endif; ?>
+    <?php if ($error): ?><div class="alert error"><?php echo $error; ?></div><?php endif; ?>
     
     <!-- Department Filter Buttons -->
     <fieldset>
@@ -183,7 +567,7 @@ foreach ($sections as $s) {
         <legend>Create New Section</legend>
         <form method="POST" action="" class="filter-form">
             <div><label>Department</label>
-                <select name="department_id" id="department_id" required onchange="updateTeachers()">
+                <select name="department_id" id="department_id" required>
                     <option value="">Select Department</option>
                     <?php foreach ($departments as $d): ?>
                     <option value="<?php echo $d['id']; ?>"><?php echo htmlspecialchars($d['name']); ?></option>
@@ -204,11 +588,6 @@ foreach ($sections as $s) {
                     <option value="">Select Year Level First</option>
                 </select>
             </div>
-            <div><label>Assign Teacher</label>
-                <select name="teacher_id" id="teacher_id" required>
-                    <option value="">Select Department First</option>
-                </select>
-            </div>
             <div><label>Academic Year</label><input type="text" name="academic_year" placeholder="e.g., 2024-2025" required></div>
             <div><label>Semester</label>
                 <select name="semester" required>
@@ -222,36 +601,6 @@ foreach ($sections as $s) {
     </fieldset>
     
     <script>
-    var allTeachers = <?php echo json_encode($teachers); ?>;
-    
-    function updateTeachers() {
-        var deptId = document.getElementById('department_id').value;
-        var teacherSelect = document.getElementById('teacher_id');
-        
-        teacherSelect.innerHTML = '<option value="">Select a Teacher</option>';
-        
-        if (deptId === '') {
-            teacherSelect.innerHTML = '<option value="">Select Department First</option>';
-            return;
-        }
-        
-        var filteredTeachers = allTeachers.filter(function(t) {
-            return t.department_id == deptId;
-        });
-        
-        if (filteredTeachers.length === 0) {
-            teacherSelect.innerHTML = '<option value="">No teachers available for this department</option>';
-            return;
-        }
-        
-        filteredTeachers.forEach(function(t) {
-            var option = document.createElement('option');
-            option.value = t.id;
-            option.text = t.full_name;
-            teacherSelect.appendChild(option);
-        });
-    }
-    
     function updateSectionCodes() {
         var yearLevel = document.getElementById('year_level').value;
         var sectionSelect = document.getElementById('section_number');
@@ -340,74 +689,71 @@ foreach ($sections as $s) {
         <legend><?php echo htmlspecialchars($s['section_name']); ?> - <?php echo htmlspecialchars($s['dept_name']); ?> (<?php echo $s['academic_year']; ?> <?php echo $s['semester']; ?>)</legend>
         
         <div class="cards">
-            <!-- Assigned Teacher -->
+            <!-- Department Teachers -->
             <div class="card">
-                <h4>Teacher</h4>
-                <?php if ($sectionDetails[$s['id']]['teacher']): ?>
-                    <p><strong><?php echo htmlspecialchars($sectionDetails[$s['id']]['teacher']['full_name']); ?></strong></p>
-                    <form method="POST" action="" class="filter-form">
-                        <input type="hidden" name="section_id" value="<?php echo $s['id']; ?>">
-                        <select name="teacher_id" required>
-                            <?php foreach ($teachers as $t): ?>
-                                <?php if ($t['department_id'] == $s['department_id']): ?>
-                                <option value="<?php echo $t['id']; ?>" <?php echo ($t['id'] == $sectionDetails[$s['id']]['teacher']['id']) ? 'selected' : ''; ?>><?php echo htmlspecialchars($t['full_name']); ?></option>
-                                <?php endif; ?>
-                            <?php endforeach; ?>
-                        </select>
-                        <button type="submit" name="change_teacher" class="btn">Change</button>
-                    </form>
+                <h4>Teachers (<?php echo count($sectionDetails[$s['id']]['assignedIds']); ?>/<?php echo count($sectionDetails[$s['id']]['teachers']); ?> assigned)</h4>
+                
+                <!-- Assign Teacher Form -->
+                <form method="POST" action="" style="margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
+                    <input type="hidden" name="section_id" value="<?php echo $s['id']; ?>">
+                    <select name="teacher_id" required style="flex: 1; min-width: 200px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem;">
+                        <option value="">Select teacher to assign...</option>
+                        <?php foreach ($sectionDetails[$s['id']]['unassigned'] as $t): ?>
+                        <option value="<?php echo $t['id']; ?>"><?php echo htmlspecialchars($t['full_name']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <button type="submit" name="assign_teacher" class="btn" style="padding: 8px 20px; font-size: 0.9rem; font-weight: 600; min-width: 100px; background: #dc3545;" <?php echo empty($sectionDetails[$s['id']]['unassigned']) ? 'disabled style="opacity: 0.5; cursor: not-allowed;"' : ''; ?>>Assign</button>
+                    <a href="?auto_assign_section=<?php echo $s['id']; ?>" class="btn" style="padding: 8px 20px; font-size: 0.9rem; font-weight: 600; min-width: 160px; background: #28a745; text-decoration: none; display: inline-block; text-align: center;" onclick="return confirm('Auto-assign ALL teachers from this department to this section?')">Auto-Assign All</a>
+                </form>
+                
+                <?php if (empty($sectionDetails[$s['id']]['teachers'])): ?>
+                    <p style="color: #666; font-style: italic;">No teachers in this department</p>
                 <?php else: ?>
-                    <p>No teacher assigned</p>
+                <ul class="teacher-list">
+                    <!-- Show Assigned Teachers First -->
+                    <?php foreach ($sectionDetails[$s['id']]['assignedTeachers'] as $t): ?>
+                    <li class="teacher-item assigned">
+                        <span class="teacher-name">
+                            <?php echo htmlspecialchars($t['full_name']); ?>
+                            <span class="badge">Assigned</span>
+                        </span>
+                        <a href="?remove_teacher=1&section_id=<?php echo $s['id']; ?>&teacher_id=<?php echo $t['id']; ?>" 
+                           class="btn-action delete" 
+                           title="Remove from section"
+                           onclick="return confirm('Remove <?php echo htmlspecialchars($t['full_name']); ?> from this section?')">Delete</a>
+                    </li>
+                    <?php endforeach; ?>
+                    
+                    <!-- Show Unassigned Teachers -->
+                    <?php foreach ($sectionDetails[$s['id']]['unassigned'] as $t): ?>
+                    <li class="teacher-item">
+                        <span class="teacher-name">
+                            <?php echo htmlspecialchars($t['full_name']); ?>
+                        </span>
+                    </li>
+                    <?php endforeach; ?>
+                </ul>
                 <?php endif; ?>
             </div>
             
             <!-- Enrolled Students -->
             <div class="card">
                 <h4>Students (<?php echo count($sectionDetails[$s['id']]['students']); ?>)</h4>
-                <form method="POST" action="" class="filter-form">
-                    <input type="hidden" name="section_id" value="<?php echo $s['id']; ?>">
-                    <select name="student_id" required>
-                        <option value="">Select Student</option>
-                        <?php 
-                        $eligibleStudents = array_filter($allStudents, function($st) use ($s, $enrolledStudentIds) {
-                            // Must have this section assigned to them (section_id matches)
-                            $hasSectionAssigned = $st['section_id'] == $s['id'];
-                            // Must NOT be already enrolled in this section
-                            $notEnrolled = !in_array($st['id'], $enrolledStudentIds);
-                            return $hasSectionAssigned && $notEnrolled;
-                        });
-                        if (empty($eligibleStudents)): 
-                        ?>
-                        <option value="" disabled>No eligible students (Dept: <?php echo htmlspecialchars($s['dept_name']); ?>, Year: <?php echo $s['year_level']; ?>)</option>
-                        <?php else: 
-                            foreach ($eligibleStudents as $st): 
-                                // Check if already enrolled
-                                $alreadyEnrolled = false;
-                                foreach ($sectionDetails[$s['id']]['students'] as $enrolled) {
-                                    if ($enrolled['id'] == $st['id']) {
-                                        $alreadyEnrolled = true;
-                                        break;
-                                    }
-                                }
-                                if (!$alreadyEnrolled):
-                        ?>
-                        <option value="<?php echo $st['id']; ?>"><?php echo htmlspecialchars($st['full_name']); ?> (<?php echo htmlspecialchars($st['dept_name']); ?>, <?php echo $st['year_level']; ?>th Year)</option>
-                        <?php 
-                                endif;
-                            endforeach;
-                        endif;
-                        ?>
-                    </select>
-                    <button type="submit" name="enroll_student" class="btn" <?php echo empty($eligibleStudents) ? 'disabled' : ''; ?>>Enroll</button>
-                </form>
-                <ul>
+                <?php if (empty($sectionDetails[$s['id']]['students'])): ?>
+                <p style="color: #666; font-style: italic;">No students enrolled</p>
+                <?php else: ?>
+                <ul class="student-list">
                     <?php foreach ($sectionDetails[$s['id']]['students'] as $st): ?>
-                    <li>
-                        <?php echo htmlspecialchars($st['full_name']); ?> 
-                        <a href="?unenroll=<?php echo $st['id']; ?>" onclick="return confirm('Unenroll?')">[x]</a>
+                    <li class="student-item">
+                        <span class="student-name"><?php echo htmlspecialchars($st['full_name']); ?></span>
+                        <div class="student-actions">
+                            <a href="users.php?edit=<?php echo $st['student_id']; ?>" class="btn-action edit" title="Edit Student">Edit</a>
+                            <a href="?unenroll=<?php echo $st['id']; ?>" class="btn-action delete" title="Unenroll Student" onclick="return confirm('Unenroll this student from section?')">Delete</a>
+                        </div>
                     </li>
                     <?php endforeach; ?>
                 </ul>
+                <?php endif; ?>
             </div>
         </div>
         

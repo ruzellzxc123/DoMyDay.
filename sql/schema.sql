@@ -135,12 +135,13 @@ CREATE TABLE sections (
     FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE CASCADE
 );
 
--- Section Assignments (one teacher per section)
+-- Section Assignments (multiple teachers per section)
 CREATE TABLE section_assignments (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    section_id INT NOT NULL UNIQUE,
+    section_id INT NOT NULL,
     teacher_id INT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_section_teacher (section_id, teacher_id),
     FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE CASCADE,
     FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
 );
@@ -168,4 +169,18 @@ CREATE TABLE teacher_summaries (
     FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE,
     FOREIGN KEY (evaluation_period_id) REFERENCES evaluation_periods(id) ON DELETE CASCADE,
     FOREIGN KEY (generated_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- Evaluation History (tracks when users complete all evaluations for a period)
+CREATE TABLE evaluation_history (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    evaluation_period_id INT NOT NULL,
+    total_evaluations INT NOT NULL,
+    status ENUM('completed','in_progress') DEFAULT 'completed',
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_user_period (user_id, evaluation_period_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (evaluation_period_id) REFERENCES evaluation_periods(id) ON DELETE CASCADE
 );

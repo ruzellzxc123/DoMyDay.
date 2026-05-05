@@ -5,6 +5,57 @@ require_once __DIR__ . '/../includes/functions.php';
 requireRole('admin');
 
 $msg = '';
+$editUser = null;
+
+// Get user for editing
+if (isset($_GET['edit'])) {
+    $editId = intval($_GET['edit']);
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
+    $stmt->execute([$editId]);
+    $editUser = $stmt->fetch();
+}
+
+// Update user
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_user'])) {
+    $userId = intval($_POST['user_id']);
+    $email = trim($_POST['email']);
+    $name = trim($_POST['full_name']);
+    $role = $_POST['role'];
+    $deptId = $_POST['department_id'] ?? null;
+    $yearLevel = $_POST['year_level'] ?? null;
+    $sectionId = $_POST['section_id'] ?? null;
+    
+    // Update user data
+    $stmt = $pdo->prepare("UPDATE users SET email = ?, full_name = ?, role = ?, department_id = ?, year_level = ?, section_id = ? WHERE id = ?");
+    $stmt->execute([$email, $name, $role, $deptId ?: null, $yearLevel ?: null, $sectionId ?: null, $userId]);
+    
+    // Update password if provided
+    if (!empty($_POST['password'])) {
+        $password = password_hash($_POST['password'], PASSWORD_BCRYPT);
+        $pdo->prepare("UPDATE users SET password = ? WHERE id = ?")->execute([$password, $userId]);
+    }
+    
+    // Sync section_students enrollment
+    if ($role === 'student') {
+        // Remove from all sections first
+        $pdo->prepare("DELETE FROM section_students WHERE student_id = ?")->execute([$userId]);
+        // Add to new section if assigned
+        if ($sectionId) {
+            try {
+                $enrollStmt = $pdo->prepare("INSERT INTO section_students (section_id, student_id) VALUES (?, ?)");
+                $enrollStmt->execute([$sectionId, $userId]);
+            } catch (PDOException $e) {
+                // Ignore duplicate errors
+            }
+        }
+    }
+    
+    auditLog($_SESSION['user_id'], 'USER_UPDATE', "Updated user $email");
+    $msg = "User updated.";
+    header("Location: users.php");
+    exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_user'])) {
     $email = trim($_POST['email']);
     $name = trim($_POST['full_name']);
@@ -16,6 +67,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_user'])) {
     
     $stmt = $pdo->prepare("INSERT INTO users (email, password, full_name, role, department_id, year_level, section_id) VALUES (?, ?, ?, ?, ?, ?, ?)");
     $stmt->execute([$email, $password, $name, $role, $deptId ?: null, $yearLevel ?: null, $sectionId ?: null]);
+    $userId = $pdo->lastInsertId();
+    
+    // Auto-enroll student in section_students if section is assigned
+    if ($role === 'student' && $sectionId) {
+        try {
+            $enrollStmt = $pdo->prepare("INSERT INTO section_students (section_id, student_id) VALUES (?, ?)");
+            $enrollStmt->execute([$sectionId, $userId]);
+        } catch (PDOException $e) {
+            // Student might already be enrolled, ignore error
+        }
+    }
+    
     auditLog($_SESSION['user_id'], 'USER_CREATE', "Created user $email as $role");
     $msg = "User added.";
 }
@@ -56,38 +119,60 @@ $sections = $pdo->query("SELECT s.*, d.department_code FROM sections s JOIN depa
 <div class="container">
     <h2>Manage Users</h2>
     <?php if ($msg): ?><div class="alert success"><?php echo $msg; ?></div><?php endif; ?>
+    
     <form method="POST" action="" class="filter-form">
-        <div><label>Email</label><input type="email" name="email" required></div>
-        <div><label>Full Name</label><input type="text" name="full_name" required></div>
-        <div><label>Password</label><input type="password" name="password" required></div>
+        <?php if ($editUser): ?>
+        <input type="hidden" name="user_id" value="<?php echo $editUser['id']; ?>">
+        <?php endif; ?>
+        
+        <div><label>Email</label><input type="email" name="email" value="<?php echo $editUser ? htmlspecialchars($editUser['email']) : ''; ?>" required></div>
+        <div><label>Full Name</label><input type="text" name="full_name" value="<?php echo $editUser ? htmlspecialchars($editUser['full_name']) : ''; ?>" required></div>
+        <div><label>Password</label><input type="password" name="password" <?php echo $editUser ? '' : 'required'; ?> placeholder="<?php echo $editUser ? 'Leave blank to keep current' : ''; ?>"></div>
         <div><label>Role</label>
             <select name="role" id="role" required onchange="toggleStudentFields()">
-                <option value="student">Student</option>
-                <option value="program_head">Program Head</option>
-                <option value="dean">Dean</option>
-                <option value="admin">Admin</option>
+                <option value="student" <?php echo ($editUser && $editUser['role'] == 'student') ? 'selected' : ''; ?>>Student</option>
+                <option value="program_head" <?php echo ($editUser && $editUser['role'] == 'program_head') ? 'selected' : ''; ?>>Program Head</option>
+                <option value="dean" <?php echo ($editUser && $editUser['role'] == 'dean') ? 'selected' : ''; ?>>Dean</option>
+                <option value="admin" <?php echo ($editUser && $editUser['role'] == 'admin') ? 'selected' : ''; ?>>Admin</option>
             </select>
         </div>
         <div><label>Department</label>
             <select name="department_id" id="department_id"><option value="">None</option>
-                <?php foreach ($departments as $de): ?><option value="<?php echo $de['id']; ?>"><?php echo htmlspecialchars($de['name']); ?></option><?php endforeach; ?>
+                <?php foreach ($departments as $de): ?>
+                <option value="<?php echo $de['id']; ?>" <?php echo ($editUser && $editUser['department_id'] == $de['id']) ? 'selected' : ''; ?>><?php echo htmlspecialchars($de['name']); ?></option>
+                <?php endforeach; ?>
             </select>
         </div>
-        <div id="student-fields" style="display: contents;">
+        <div id="student-fields" style="display: <?php echo ($editUser && $editUser['role'] != 'student') ? 'none' : 'contents'; ?>;">
             <div><label>Year Level</label>
                 <select name="year_level" id="year_level" onchange="updateSections()"><option value="">None</option>
-                    <option value="1">1st Year</option>
-                    <option value="2">2nd Year</option>
-                    <option value="3">3rd Year</option>
-                    <option value="4">4th Year</option>
+                    <option value="1" <?php echo ($editUser && $editUser['year_level'] == 1) ? 'selected' : ''; ?>>1st Year</option>
+                    <option value="2" <?php echo ($editUser && $editUser['year_level'] == 2) ? 'selected' : ''; ?>>2nd Year</option>
+                    <option value="3" <?php echo ($editUser && $editUser['year_level'] == 3) ? 'selected' : ''; ?>>3rd Year</option>
+                    <option value="4" <?php echo ($editUser && $editUser['year_level'] == 4) ? 'selected' : ''; ?>>4th Year</option>
                 </select>
             </div>
             <div><label>Section</label>
-                <select name="section_id" id="section_id"><option value="">Select Department and Year First</option>
+                <select name="section_id" id="section_id">
+                    <option value="">Select Department and Year First</option>
+                    <?php if ($editUser && $editUser['section_id']): ?>
+                    <?php foreach ($sections as $s): ?>
+                        <?php if ($s['id'] == $editUser['section_id']): ?>
+                        <option value="<?php echo $s['id']; ?>" selected><?php echo htmlspecialchars($s['section_name']); ?></option>
+                        <?php endif; ?>
+                    <?php endforeach; ?>
+                    <?php endif; ?>
                 </select>
             </div>
         </div>
-        <div><button type="submit" name="add_user" class="btn">Add User</button></div>
+        <div>
+            <?php if ($editUser): ?>
+            <button type="submit" name="update_user" class="btn">Update User</button>
+            <a href="users.php" class="btn" style="background: #6c757d;">Cancel</a>
+            <?php else: ?>
+            <button type="submit" name="add_user" class="btn">Add User</button>
+            <?php endif; ?>
+        </div>
     </form>
     
     <script>
@@ -155,7 +240,10 @@ $sections = $pdo->query("SELECT s.*, d.department_code FROM sections s JOIN depa
             ?></td>
             <td><?php echo htmlspecialchars($u['section_name'] ?? '-'); ?></td>
             <td><?php echo $u['is_active'] ? 'Yes' : 'No'; ?></td>
-            <td><a class="btn" href="?toggle=<?php echo $u['id']; ?>">Toggle</a></td>
+            <td>
+                <a class="btn" href="?edit=<?php echo $u['id']; ?>" style="background: #ffc107; color: #212529;">Edit</a>
+                <a class="btn" href="?toggle=<?php echo $u['id']; ?>" style="background: #6c757d;">Toggle</a>
+            </td>
         </tr>
         <?php endforeach; ?>
         </tbody>

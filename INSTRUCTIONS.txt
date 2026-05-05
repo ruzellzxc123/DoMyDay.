@@ -1,0 +1,384 @@
+================================================================================
+                    TEACHER EVALUATION SYSTEM
+                        Setup Instructions
+================================================================================
+
+1. SYSTEM OVERVIEW
+================================================================================
+
+The Teacher Evaluation System is a web-based application for evaluating 
+teacher performance across multiple user roles with different evaluation 
+criteria and weights.
+
+User Roles:
+- Admin: Full system management (users, teachers, sections, periods, reports)
+- Dean (20% weight): Evaluates teachers in their department
+- Program Head (30% weight): Evaluates teachers in their department  
+- Student (50% weight): Evaluates teachers assigned to their sections
+
+Each role evaluates different criteria:
+- Students: Teaching Clarity, Engagement, Fairness
+- Program Heads: Curriculum, Assessment, Mentoring
+- Deans: Attendance, Commitment, Quality
+
+2. INSTALLATION REQUIREMENTS
+================================================================================
+
+- PHP 7.4 or higher
+- MySQL 5.7 or higher
+- Apache Web Server (XAMPP/WAMP recommended)
+- Web browser
+
+3. DATABASE SETUP
+================================================================================
+
+Option A: Using setup.php
+-------------------------
+1. Navigate to: http://localhost/HACKATHON/setup.php
+2. The script will create the database and tables automatically
+3. Demo accounts will be created (see section 5)
+
+Option B: Manual SQL Import
+---------------------------
+1. Open phpMyAdmin or MySQL client
+2. Create database: CREATE DATABASE teacher_eval;
+3. Import the SQL schema below:
+
+--------------------------------------------------------------------------------
+-- DATABASE SCHEMA (sql/schema.sql)
+--------------------------------------------------------------------------------
+
+CREATE DATABASE IF NOT EXISTS teacher_eval;
+USE teacher_eval;
+
+-- Departments (CCS, COE, CBAE, CBA, COA)
+CREATE TABLE departments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    department_code VARCHAR(10) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert default departments
+INSERT INTO departments (name, department_code) VALUES
+('College of Business Administration', 'CBA'),
+('College of Entrepreneurship', 'COE'),
+('College of Accountancy', 'COA'),
+('College of Education', 'CED'),
+('College of Computer Studies', 'CCS');
+
+-- Users (Students, Program Heads, Deans, Admins)
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(100) NOT NULL UNIQUE,
+    password VARCHAR(255) NOT NULL,
+    full_name VARCHAR(100) NOT NULL,
+    role ENUM('student','program_head','dean','admin') NOT NULL,
+    department_id INT NULL,
+    year_level INT NULL,
+    section_id INT NULL,
+    is_active TINYINT(1) DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL
+);
+
+-- Teachers
+CREATE TABLE teachers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    full_name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) NOT NULL UNIQUE,
+    department_id INT NOT NULL,
+    is_active TINYINT(1) DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE CASCADE
+);
+
+-- Evaluation Periods
+CREATE TABLE evaluation_periods (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(100) NOT NULL,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    is_active TINYINT(1) DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Evaluations (Student responses are anonymous: rater_id NULL for students)
+CREATE TABLE evaluations (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    teacher_id INT NOT NULL,
+    rater_id INT NULL,
+    rater_role ENUM('student','program_head','dean') NOT NULL,
+    evaluation_period_id INT NOT NULL,
+    
+    -- Student criteria (50%)
+    teaching_clarity INT CHECK(teaching_clarity BETWEEN 1 AND 5),
+    engagement INT CHECK(engagement BETWEEN 1 AND 5),
+    fairness INT CHECK(fairness BETWEEN 1 AND 5),
+    
+    -- Program Head criteria (30%)
+    curriculum INT CHECK(curriculum BETWEEN 1 AND 5),
+    assessment INT CHECK(assessment BETWEEN 1 AND 5),
+    mentoring INT CHECK(mentoring BETWEEN 1 AND 5),
+    
+    -- Dean criteria (20%)
+    attendance INT CHECK(attendance BETWEEN 1 AND 5),
+    commitment INT CHECK(commitment BETWEEN 1 AND 5),
+    quality INT CHECK(quality BETWEEN 1 AND 5),
+    
+    comments TEXT,
+    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE,
+    FOREIGN KEY (rater_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (evaluation_period_id) REFERENCES evaluation_periods(id) ON DELETE CASCADE
+);
+
+-- Audit Logs
+CREATE TABLE audit_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NULL,
+    action VARCHAR(50) NOT NULL,
+    details TEXT,
+    ip_address VARCHAR(45),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- Email Queue for Reminders
+CREATE TABLE email_queue (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    body TEXT NOT NULL,
+    status ENUM('pending','sent','failed') DEFAULT 'pending',
+    sent_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Sections (tied to department and year level)
+CREATE TABLE sections (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    section_name VARCHAR(50) NOT NULL,
+    department_id INT NOT NULL,
+    year_level INT NOT NULL,
+    academic_year VARCHAR(20) NOT NULL,
+    semester VARCHAR(20) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE CASCADE
+);
+
+-- Section Assignments (multiple teachers per section)
+CREATE TABLE section_assignments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    section_id INT NOT NULL,
+    teacher_id INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_section_teacher (section_id, teacher_id),
+    FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE CASCADE,
+    FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+);
+
+-- Section Students (which students are enrolled in which section)
+CREATE TABLE section_students (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    section_id INT NOT NULL,
+    student_id INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_section_student (section_id, student_id),
+    FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE CASCADE,
+    FOREIGN KEY (student_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- AI Generated Teacher Summaries
+CREATE TABLE teacher_summaries (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    teacher_id INT NOT NULL,
+    evaluation_period_id INT NOT NULL,
+    summary_text TEXT NOT NULL,
+    generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    generated_by INT NULL,
+    UNIQUE KEY unique_summary (teacher_id, evaluation_period_id),
+    FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE,
+    FOREIGN KEY (evaluation_period_id) REFERENCES evaluation_periods(id) ON DELETE CASCADE,
+    FOREIGN KEY (generated_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- Evaluation History (tracks when users complete all evaluations for a period)
+CREATE TABLE evaluation_history (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    evaluation_period_id INT NOT NULL,
+    total_evaluations INT NOT NULL,
+    status ENUM('completed','in_progress') DEFAULT 'completed',
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_user_period (user_id, evaluation_period_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (evaluation_period_id) REFERENCES evaluation_periods(id) ON DELETE CASCADE
+);
+
+--------------------------------------------------------------------------------
+
+4. CONFIGURATION
+================================================================================
+
+Edit config/config.php:
+
+<?php
+// Database Configuration
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'teacher_eval');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+
+// Base URL
+define('BASE_URL', 'http://localhost/HACKATHON/');
+
+// Evaluation Weights
+define('WEIGHT_STUDENT', 0.50);
+define('WEIGHT_PROGRAM_HEAD', 0.30);
+define('WEIGHT_DEAN', 0.20);
+
+// Gemini AI API (optional - for generating teacher summaries)
+define('GEMINI_API_KEY', 'your_api_key_here');
+define('GEMINI_MODEL', 'gemini-2.0-flash');
+
+// Email Configuration (optional - for reminders)
+define('GMAIL_USER', 'your_email@gmail.com');
+define('GMAIL_PASS', 'your_app_password');
+?>
+
+5. DEFAULT LOGIN CREDENTIALS
+================================================================================
+
+After setup, use these demo accounts:
+
+Role          | Email                    | Password
+--------------|--------------------------|----------
+Admin         | admin@school.edu         | admin123
+Dean          | dean@school.edu          | dean123
+Program Head  | ph@school.edu            | ph123
+Student       | student@school.edu       | student123
+
+6. WORKFLOW GUIDE
+================================================================================
+
+STEP 1: Admin Setup
+-------------------
+1. Login as admin@school.edu
+2. Go to "Manage Periods" - Create evaluation period (set dates, activate)
+3. Go to "Manage Teachers" - Add teachers to departments
+4. Go to "Manage Sections" - Create sections:
+   - Section auto-assigns ALL teachers from department
+   - Section auto-enrolls ALL matching students (same dept/year level)
+5. Go to "Manage Users" - Create student accounts:
+   - Students auto-enroll to matching sections (same dept/year level)
+
+STEP 2: Teacher Assignment (Alternative)
+----------------------------------------
+- When creating a NEW teacher, they auto-assign to ALL sections in their dept
+- Use "Auto-Assign All" button on section card to assign all remaining teachers
+- Use dropdown + "Assign" button to assign individual teachers
+
+STEP 3: Student Evaluation
+--------------------------
+1. Student logs in and sees dashboard
+2. Dashboard shows ALL teachers assigned to their enrolled sections
+3. Student clicks "Evaluate Now" for each teacher
+4. After evaluating ALL teachers, student can create evaluation history record
+5. Student can view evaluation history to see past evaluations by period
+
+STEP 4: Program Head/Dean Evaluation
+------------------------------------
+1. Login as Program Head or Dean
+2. Dashboard shows ALL teachers in their department
+3. Evaluate each teacher using role-specific criteria
+4. View evaluation history for their completed evaluations
+
+STEP 5: Reports & Analysis
+--------------------------
+1. Admin/Dean/Program Head can view reports
+2. Select teacher and period to see:
+   - Composite score (weighted average)
+   - Individual criteria breakdown by rater role
+   - Comments from all evaluators
+   - AI-generated performance summary (if configured)
+3. Export reports as CSV or PDF
+
+7. KEY FEATURES
+================================================================================
+
+Auto-Assignment Logic:
+- Creating Section → Auto-assigns ALL dept teachers + auto-enrolls matching students
+- Creating Teacher → Auto-assigns to ALL sections in their department  
+- Creating Student → Auto-enrolls to ALL matching sections (same dept/year level)
+- Assigning Teacher → Auto-enrolls matching students to that section
+
+Anonymous Student Evaluations:
+- Student evaluations don't record rater_id (stored as NULL)
+- Students cannot see who evaluated which teacher
+- Session-based tracking prevents duplicate evaluations
+
+Evaluation Weights:
+- Student: 50% (Teaching Clarity, Engagement, Fairness)
+- Program Head: 30% (Curriculum, Assessment, Mentoring)
+- Dean: 20% (Attendance, Commitment, Quality)
+
+Composite Score Calculation:
+Score = (Student_Avg * 0.50) + (PH_Avg * 0.30) + (Dean_Avg * 0.20)
+
+8. TROUBLESHOOTING
+================================================================================
+
+Issue: "Duplicate entry for key 'section_id'" error
+Fix: Run admin/fix_section_assignments.php to recreate table with correct constraints
+
+Issue: Teachers not showing on student dashboard
+Check: Verify section_assignments table has correct unique constraint (section_id, teacher_id)
+
+Issue: Cannot auto-assign teachers
+Check: Ensure teachers are active (is_active = 1) and belong to the section's department
+
+9. FILE STRUCTURE
+================================================================================
+
+HACKATHON/
+├── admin/              # Admin panel files
+│   ├── dashboard.php
+│   ├── sections.php    # Manage sections, auto-assign teachers
+│   ├── teachers.php    # Manage teachers, auto-assign to sections
+│   ├── users.php       # Manage users, auto-enroll students
+│   ├── periods.php
+│   ├── reports.php
+│   └── ...
+├── config/
+│   └── config.php      # Database & app configuration
+├── includes/
+│   ├── db.php          # Database connection
+│   ├── functions.php   # Utility functions
+│   └── gemini.php      # AI summary generation
+├── sql/
+│   └── schema.sql      # Database schema
+├── assets/
+│   └── css/style.css   # Stylesheets
+├── index.php           # Login page
+├── dashboard.php       # User dashboard
+├── evaluate.php        # Evaluation form
+├── evaluation_history.php  # View past evaluations
+└── setup.php           # Initial setup script
+
+10. SECURITY NOTES
+================================================================================
+
+- All passwords are hashed using bcrypt
+- Role-based access control on all pages
+- PDO prepared statements prevent SQL injection
+- Session-based authentication
+- Audit logging for all major actions
+- Student evaluations are anonymous (no rater_id stored)
+
+================================================================================
+                         END OF INSTRUCTIONS
+================================================================================

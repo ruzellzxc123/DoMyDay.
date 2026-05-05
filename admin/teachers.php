@@ -5,15 +5,62 @@ require_once __DIR__ . '/../includes/functions.php';
 requireRole('admin');
 
 $msg = '';
+$error = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_teacher'])) {
     $name = trim($_POST['full_name']);
     $email = trim($_POST['email']);
     $deptId = $_POST['department_id'];
     
-    $stmt = $pdo->prepare("INSERT INTO teachers (full_name, email, department_id) VALUES (?, ?, ?)");
-    $stmt->execute([$name, $email, $deptId]);
-    auditLog($_SESSION['user_id'], 'TEACHER_CREATE', "Created teacher $email");
-    $msg = "Teacher added.";
+    // Check if email already exists
+    $check = $pdo->prepare("SELECT COUNT(*) FROM teachers WHERE email = ?");
+    $check->execute([$email]);
+    if ($check->fetchColumn() > 0) {
+        $error = "Error: A teacher with email '$email' already exists.";
+    } else {
+        try {
+            $pdo->beginTransaction();
+            
+            // Insert teacher
+            $stmt = $pdo->prepare("INSERT INTO teachers (full_name, email, department_id) VALUES (?, ?, ?)");
+            $stmt->execute([$name, $email, $deptId]);
+            $teacherId = $pdo->lastInsertId();
+            
+            // Auto-assign to all sections in this department
+            $sectionStmt = $pdo->prepare("SELECT id, section_name FROM sections WHERE department_id = ?");
+            $sectionStmt->execute([$deptId]);
+            $sections = $sectionStmt->fetchAll();
+            
+            $assignmentStmt = $pdo->prepare("INSERT INTO section_assignments (section_id, teacher_id) VALUES (?, ?)");
+            $assignedCount = 0;
+            
+            foreach ($sections as $section) {
+                try {
+                    $assignmentStmt->execute([$section['id'], $teacherId]);
+                    $assignedCount++;
+                } catch (PDOException $e) {
+                    // Skip if already assigned
+                    if (strpos($e->getMessage(), 'unique_section_teacher') === false) {
+                        throw $e;
+                    }
+                }
+            }
+            
+            $pdo->commit();
+            
+            auditLog($_SESSION['user_id'], 'TEACHER_CREATE', "Created teacher $email and assigned to $assignedCount sections in department $deptId");
+            $msg = "Teacher added" . ($assignedCount > 0 ? " and assigned to $assignedCount section(s)." : ".");
+        } catch (PDOException $e) {
+            $pdo->rollBack();
+            if (strpos($e->getMessage(), 'Duplicate entry') !== false) {
+                $error = "Error: A teacher with email '$email' already exists.";
+            } else {
+                $error = "Error adding teacher: " . $e->getMessage();
+            }
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            $error = "Error adding teacher: " . $e->getMessage();
+        }
+    }
 }
 
 if (isset($_GET['toggle'])) {
@@ -51,6 +98,7 @@ $departments = $pdo->query("SELECT * FROM departments")->fetchAll();
 <div class="container">
     <h2>Manage Teachers</h2>
     <?php if ($msg): ?><div class="alert success"><?php echo $msg; ?></div><?php endif; ?>
+    <?php if ($error): ?><div class="alert error"><?php echo $error; ?></div><?php endif; ?>
     <form method="POST" action="" class="filter-form">
         <div><label>Full Name</label><input type="text" name="full_name" required></div>
         <div><label>Email</label><input type="email" name="email" required></div>
