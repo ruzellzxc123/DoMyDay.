@@ -1,0 +1,60 @@
+Date: 2026-05-02 02:40:30
+To: dean@school.edu
+Subject: Reminder: Teacher Evaluation Pending
+Body: Hi College Dean,
+
+Please complete your teacher evaluation for the current period.
+
+Login at: http://127.0.0.1/HACKATHON/index.php
+----------------------------------------
+
+Date: 2026-05-02 02:40:32
+To: ph@school.edu
+Subject: Reminder: Teacher Evaluation Pending
+Body: Hi Program Head,
+
+Please complete your teacher evaluation for the current period.
+
+Login at: http://127.0.0.1/HACKATHON/index.php
+----------------------------------------
+
+Date: 2026-05-02 02:40:35
+To: student@school.edu
+Subject: Reminder: Teacher Evaluation Pending
+Body: Hi John Student,
+
+Please complete your teacher evaluation for the current period.
+
+Login at: http://127.0.0.1/HACKATHON/index.php
+----------------------------------------
+
+Date: 2026-05-02 02:40:37
+To: ruzellgarcia@gmail.com
+Subject: Reminder: Teacher Evaluation Pending
+Body: Hi Ruzell Garcia,
+
+Please complete your teacher evaluation for the current period.
+
+Login at: http://127.0.0.1/HACKATHON/index.php
+----------------------------------------
+
+Date: 2026-05-02 02:40:39
+To: iromogote@gmail.com
+Subject: Reminder: Teacher Evaluation Pending
+Body: Hi Iro Mogote,
+
+Please complete your teacher evaluation for the current period.
+
+Login at: http://127.0.0.1/HACKATHON/index.php
+----------------------------------------
+
+Date: 2026-05-02 02:40:41
+To: section305@gmail.com
+Subject: Reminder: Teacher Evaluation Pending
+Body: Hi section305@gmail.com,
+
+Please complete your teacher evaluation for the current period.
+
+Login at: http://127.0.0.1/HACKATHON/index.php
+----------------------------------------
+
