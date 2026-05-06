@@ -21,7 +21,7 @@ date_default_timezone_set('Asia/Manila');
 // Set your API key here or leave empty and configure via environment variable
 // Get your key from: https://aistudio.google.com/app/apikey
 // Model: use 'gemini-flash-2.5' or the latest flash model available
-define('GEMINI_API_KEY', '');
+define('GEMINI_API_KEY', );
 define('GEMINI_MODEL', 'gemini-2.5-flash');
 define('GEMINI_API_URL', 'https://generativelanguage.googleapis.com/v1beta/models/' . GEMINI_MODEL . ':generateContent');
 
